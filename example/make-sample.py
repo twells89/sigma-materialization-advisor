@@ -40,6 +40,13 @@ workload = [
         22.0, 9_500_000_000,
         f"{U}/workbook/Adhoc-Cohort-Explorer-ddd444?:displayNodeId=cohort-tbl",
         PARTITION_SCAN_PCT=94),
+    # Three copies of one scheduled workbook: duplicate work (see `duplicates` below).
+    row("/workbook/Orders-Daily-Copy-A-mmm111", "master", 120, .6, .8, 1.4, 2.0,
+        90_000_000, f"{U}/workbook/Orders-Daily-Copy-A-mmm111?:displayNodeId=master"),
+    row("/workbook/Orders-Daily-Copy-B-nnn222", "master", 90, .5, .8, 1.4, 2.0,
+        90_000_000, f"{U}/workbook/Orders-Daily-Copy-B-nnn222?:displayNodeId=master"),
+    row("/workbook/Orders-Daily-Copy-C-ooo333", "master", 40, .2, .8, 1.4, 2.0,
+        90_000_000, f"{U}/workbook/Orders-Daily-Copy-C-ooo333?:displayNodeId=master"),
     # Monitor: cheap and fast.
     row("/workbook/Marketing-Overview-fff666", "chart-1", 64, 0.18, 0.4, .7, 0.9,
         40_000_000, f"{U}/workbook/Marketing-Overview-fff666?:displayNodeId=chart-1"),
@@ -76,6 +83,38 @@ materializations = [
     mat("/workbook/Legacy-Snapshot-iii999", "table-main",
         f"{U}/workbook/Legacy-Snapshot-iii999?:displayNodeId=table-main",
         30, 8.0, 40, 1.5, 0, 0),
+] + [
+    mat(f"/workbook/Orders-Daily-Copy-{c}-{i}", "master",
+        f"{U}/workbook/Orders-Daily-Copy-{c}-{i}?:displayNodeId=master",
+        30, 2.0, served, 1.1, 5, 6.0)
+    for c, i, served in (("A", "mmm111", 90), ("B", "nnn222", 60), ("C", "ooo333", 25))
+]
+
+
+def dup(match, signature, obj, el, runs, credits, tables=None):
+    return {"MATCH": match, "SIGNATURE": signature, "ORG": "northwind",
+            "OBJECT": obj, "ELEMENT": el,
+            "SAMPLE_URL": f"{U}{obj}?:displayNodeId={el}", "RUNS": runs,
+            "CREDITS": credits, "BASE_TABLES": tables}
+
+
+ORDERS = "NORTHWIND.SALES.CUSTOMERS,NORTHWIND.SALES.ORDERS"
+duplicates = [
+    # Identical CTAS text in three copies of one workbook.
+    dup("identical-build", "sig-orders-daily", f"/workbook/Orders-Daily-Copy-{c}-{i}",
+        "master", 30, 2.0, ORDERS)
+    for c, i in (("A", "mmm111"), ("B", "nnn222"), ("C", "ooo333"))
+] + [
+    # Different SQL, same source table.
+    dup("same-base-tables", "sig-ledger", "/workbook/Finance-Snapshot-hhh888",
+        "master", 30, 1.0, "NORTHWIND.FINANCE.LEDGER"),
+    dup("same-base-tables", "sig-ledger", "/workbook/Legacy-Snapshot-iii999",
+        "table-main", 30, 8.0, "NORTHWIND.FINANCE.LEDGER"),
+    # The same live query from two dashboards.
+    dup("identical-live-query", "sig-live-orders", "/workbook/Customer-Overview-jjj000",
+        "orders", 180, 4.2),
+    dup("identical-live-query", "sig-live-orders", "/workbook/Marketing-Overview-fff666",
+        "chart-1", 64, .18),
 ]
 
 bundle = {
@@ -91,6 +130,7 @@ bundle = {
         "UNATTRIBUTED_QAS_CREDITS": 2.0,
     }],
     "materializations": materializations,
+    "duplicates": duplicates,
     "warehouses": [{
         "WAREHOUSE_COMPUTE_CREDITS": 70.0,
         "ATTRIBUTED_QUERY_CREDITS": 45.0,
