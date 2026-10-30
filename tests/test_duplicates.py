@@ -150,6 +150,15 @@ class AssembleTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["MATCH"], "identical-sql")
 
+    def test_merge_does_not_upgrade_different_elements_in_same_workbooks(self):
+        sf = assemble_duplicates([
+            drow("same-base-tables", "s1", "Orders-Copy-wbAAA", el="customers"),
+            drow("same-base-tables", "s1", "Orders-Copy-wbBBB", el="customers"),
+        ], 30)
+        merged = merge_groups(sf, _normalise_scan_groups(scan_fixture()))
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["MATCH"], "same-base-tables")
+
     def test_member_refresh_source_marks_cron_vs_observed(self):
         sf = assemble_duplicates([drow("identical-build", "s1", "Orders-Copy-wbAAA"),
                                   drow("identical-build", "s1", "Orders-Copy-wbBBB")], 30)

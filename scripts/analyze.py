@@ -765,7 +765,9 @@ def merge_groups(snowflake_groups, scan_groups):
         if twin is None:
             out.append(s)
             continue
-        if twin["MATCH"] == "same-base-tables" and s["MATCH"] in (
+        exact_members = ({_mkey(m) for m in twin["MEMBERS"]}
+                         == {_mkey(m) for m in s["MEMBERS"]})
+        if exact_members and twin["MATCH"] == "same-base-tables" and s["MATCH"] in (
                 "identical-logic", "identical-sql"):
             twin["MATCH"] = s["MATCH"]
         if not twin["BASE_TABLES"]:
