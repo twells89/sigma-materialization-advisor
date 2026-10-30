@@ -143,6 +143,13 @@ class AssembleTests(unittest.TestCase):
         self.assertEqual(merged[0]["BASE_TABLES"], ["NORTHWIND.SALES.ORDERS"])
         self.assertIn("analyst@example.com", {m["OWNER_EMAIL"] for m in merged[0]["MEMBERS"]})
 
+    def test_merge_upgrades_same_tables_to_scan_match(self):
+        sf = assemble_duplicates([drow("same-base-tables", "s1", "Orders-Copy-wbAAA"),
+                                  drow("same-base-tables", "s1", "Orders-Copy-wbBBB")], 30)
+        merged = merge_groups(sf, _normalise_scan_groups(scan_fixture()))
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["MATCH"], "identical-sql")
+
     def test_member_refresh_source_marks_cron_vs_observed(self):
         sf = assemble_duplicates([drow("identical-build", "s1", "Orders-Copy-wbAAA"),
                                   drow("identical-build", "s1", "Orders-Copy-wbBBB")], 30)
@@ -190,6 +197,20 @@ class AssembleTests(unittest.TestCase):
         flags = {g["MATCH"]: g["LOW_VALUE"] for g in groups}
         self.assertTrue(flags["identical-live-query"])
         self.assertFalse(flags["identical-build"])
+
+    def test_candidate_keeps_highest_scoring_consolidation_group(self):
+        from analyze import finalize_groups
+        from cost_model import merge_config
+        rows = [drow(match, match, wb, credits=3.0)
+                for match in ("identical-build", "identical-live-query")
+                for wb in ("wbA", "wbB")]
+        candidates = [workload(wb) for wb in ("wbA", "wbB")]
+        groups = finalize_groups(
+            assemble_duplicates(rows, 30), candidates, merge_config(), 30, 3.0)
+        best = groups[0]
+        self.assertEqual(best["MATCH"], "identical-build")
+        self.assertEqual({r["CONSOLIDATION_GROUP"] for r in candidates},
+                         {best["GROUP_ID"]})
 
     def test_unscheduled_scan_group_is_not_absorbed_and_superset_is(self):
         from analyze import _normalise_scan_groups

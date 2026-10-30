@@ -511,8 +511,14 @@ def _has(v):
     return v is not None and str(v).strip() != ""
 
 
-def has_query_counts(records):
-    return any(_has(rec.get("query_count")) for rec in records)
+def _query_count_keys(records):
+    keys = set()
+    for rec in records:
+        obj, _ = _cost_object(rec)
+        if obj and _has(rec.get("query_count")):
+            element = str(rec.get("element_id") or "").strip() or "(workbook load)"
+            keys.add((obj, element))
+    return keys
 
 
 def cost_table_rows(records, credit_price, org=None):
@@ -759,6 +765,9 @@ def merge_groups(snowflake_groups, scan_groups):
         if twin is None:
             out.append(s)
             continue
+        if twin["MATCH"] == "same-base-tables" and s["MATCH"] in (
+                "identical-logic", "identical-sql"):
+            twin["MATCH"] = s["MATCH"]
         if not twin["BASE_TABLES"]:
             twin["BASE_TABLES"] = s["BASE_TABLES"]
         for f in ("SOURCE_REF", "DOWNSTREAM_ELEMENTS", "DOWNSTREAM_COUNT"):
@@ -830,7 +839,7 @@ def finalize_groups(groups, candidates, cfg, days, credit_price, aliases=None):
         g["GROUP_ID"] = f"{prefix}-{counts[prefix]}"
         for m in g["MEMBERS"]:
             for r in candidates_of(m):
-                r["CONSOLIDATION_GROUP"] = g["GROUP_ID"]
+                r.setdefault("CONSOLIDATION_GROUP", g["GROUP_ID"])
     return [{"GROUP_ID": g["GROUP_ID"], **{k: v for k, v in g.items() if k != "GROUP_ID"}}
             for g in groups]
 
@@ -955,10 +964,14 @@ def main():
             "materialization_credits": sum(r["MATERIALIZATION_CREDITS"] for r in rows),
         }]
         scheduled = lambda r: r["MATERIALIZATION_RUNS"] or r["MATERIALIZATION_CREDITS"] > 0
-        if has_query_counts(records):
-            kept = [r for r in rows if scheduled(r) or r["RUNS"] >= a.min_runs]
-        else:
-            kept = [r for r in rows if r["CREDITS"] + r["MATERIALIZATION_CREDITS"] > 0]
+        counted = _query_count_keys(records)
+        kept = [
+            r for r in rows
+            if scheduled(r)
+            or ((r["OBJECT"], r["ELEMENT"]) in counted and r["RUNS"] >= a.min_runs)
+            or ((r["OBJECT"], r["ELEMENT"]) not in counted
+                and r["CREDITS"] + r["MATERIALIZATION_CREDITS"] > 0)
+        ]
         kept.sort(key=lambda r: -(r["CREDITS"] + r["MATERIALIZATION_CREDITS"]))
         rows = kept[:a.limit] + [r for r in kept[a.limit:] if scheduled(r)]
         evidence_notes += [

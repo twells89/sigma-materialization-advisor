@@ -117,6 +117,14 @@ class CostTableTests(unittest.TestCase):
         self.assertEqual(inv["coverage"]["attributable_credits"], 2.0)
         self.assertEqual(inv["totals"]["credit_coverage_pct"], 100.0)
 
+    def test_rows_without_query_count_use_credit_filter_when_counts_are_partial(self):
+        inv = self.run_table([
+            {"workbook_id": "wbCounted", "credits": 0.1, "query_count": 5},
+            {"workbook_id": "wbCreditsOnly", "credits": 10.0},
+        ])
+        self.assertEqual({r["OBJECT"] for r in inv["candidates"]},
+                         {"/workbook/wbCounted", "/workbook/wbCreditsOnly"})
+
     def test_numeric_zero_credits_row_is_kept(self):
         rows, _, warnings = cost_table_rows(
             [{"workbook_id": "wbAAA", "credits": 0, "query_count": 5}], 3.0)
