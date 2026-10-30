@@ -29,7 +29,26 @@ performance together; never infer that deletion is safe from refresh cost alone.
   `SNOWFLAKE.ACCOUNT_USAGE`; `ACCESS_HISTORY` requires the applicable Enterprise
   privileges). SSO (`externalbrowser`) or key-pair both work.
 - **Sigma REST** (`SIGMA_BASE_URL` plus a token or client credentials) — for read-only
-  schedule/control/lineage enrichment and explicit remediation actions.
+  schedule/control/lineage enrichment, the workbook scan, and explicit remediation actions.
+
+## Choose the input path — ask first
+**Can the person running this query `SNOWFLAKE.ACCOUNT_USAGE`?** Prefer the first path that
+applies. Each later path measures less, and the report says what was not measured.
+
+| Path | Command | Measures | Doesn't measure |
+|---|---|---|---|
+| **Snowflake** (default, most complete) | `analyze.py --conn <snow-conn>` | credits, latency, refresh cost, served reads, duplicate builds | — |
+| **Exported rows** (Cortex Code / notebook) | `analyze.py --from-rows bundle.json` | same as Snowflake | — |
+| **Cost table** (an internal cost tool's export) | `analyze.py --from-cost-table costs.csv` | credits or cost per workbook/element | served reads, so a materialization is never retuned or removed on this evidence |
+| **Sigma only** (no warehouse access) | `scan_workbooks.py` then `analyze.py --sigma-only --scan scan.json` | duplicate logic, schedules, refreshes/day, owners | any cost or latency |
+
+Add `--scan scan.json` to any path to find duplicate logic hidden behind materializations.
+A materialized element's compiled SQL reads only its own write-back table, so the scan
+fingerprints the element definition from the workbook spec instead.
+
+Cost table columns (CSV or JSON, case-insensitive): one of `workbook_id` / `data_model_id` /
+`object`; one of `credits` / `cost`; optional `element_id`, `date`, `query_count`,
+`avg_sec`, `p95_sec`, `kind` (`materialization` = refresh cost), `owner_email`.
 
 ## Intake — ask before the first run
 Persist answers in `advisor-config.json`; do not use blind defaults for a customer.
@@ -56,26 +75,42 @@ Persist the answers in `advisor-config.json` (see `advisor-config.example.json`)
 `--config advisor-config.json` so re-runs are consistent.
 
 ## Phases
-1. **Analyze** — full Sigma cost coverage, source-level workload, materialization
-   utilization, and warehouse context → schema-v2 `inventory.json` + `REPORT.md`.
-2. **Enrich** — `scripts/enrich.py` resolves schedules, controls, and lineage. Because
-   current APIs do not expose control target bindings, any control-bearing workbook is
-   `review required`.
-3. **Report** — render keep/retune/investigate/remove/add/query-optimization decisions.
-4. **Remediate (opt-in)** — use `materialize.py --dry-run` first. Removal requires a
+1. **Scan (optional, Sigma API only)** — `scripts/scan_workbooks.py` finds duplicate
+   logic, schedules, refreshes/day, and owners → `scan.json`. It never stores raw SQL.
+2. **Analyze** — full Sigma cost coverage, source-level workload, materialization
+   utilization, duplicate work, and warehouse context → schema-v2 `inventory.json` +
+   `REPORT.md`.
+3. **Enrich** — `scripts/enrich.py` resolves schedules, controls, lineage, and owners.
+   Because current APIs do not expose control target bindings, any control-bearing workbook
+   is `review required`.
+4. **Report** — render decisions with an impact tier and plain fix steps. Use
+   `--by-owner DIR` for one report per workbook owner (plus `owners.csv`), so a central team
+   can send each owner only their items.
+5. **Remediate (opt-in)** — use `materialize.py --dry-run` first. Removal requires a
    measured no-materialization baseline, owner approval, and rollback details.
+6. **Measure** — at least two weeks after changes, re-run over the same scope and window
+   (enrich both runs), then `scripts/compare.py --before A --after B --out C` and
+   `scripts/render-savings.py --compare C/compare.json --out savings.html`. The report shows
+   realized savings, which recommendations were acted on (verified from schedule changes where
+   possible), savings by owner, and what is still open. Read savings use cost per run, so
+   traffic changes are not counted as savings, and refresh savings are counted separately.
+   Savings are attributed because they coincide with a change, not proven caused by it.
 
 ## Scripts
 | Script | Purpose |
 |---|---|
-| `scripts/analyze.py` | Snowflake cost/performance evidence → v2 inventory + report |
-| `scripts/cost_model.py` | pure recommendation and savings logic |
-| `scripts/enrich.py` | read-only Sigma API schedule/control/lineage pass |
+| `scripts/analyze.py` | cost/performance evidence (any input path) → v2 inventory + report |
+| `scripts/cost_model.py` | pure recommendation, consolidation, impact, and savings logic |
+| `scripts/scan_workbooks.py` | read-only Sigma API scan for duplicate logic and schedules |
+| `scripts/enrich.py` | read-only Sigma API schedule/control/lineage/owner pass |
 | `scripts/materialize.py` | explicit schedule CRUD / refresh with `--dry-run` |
-| `scripts/render-html.py` | `inventory.json` → customer-facing `report.html` |
+| `scripts/render-html.py` | `inventory.json` → `report.html`, or per-owner reports |
+| `scripts/compare.py` | before/after inventories → realized savings + follow-through (`compare.json`, CSVs, `COMPARE.md`) |
+| `scripts/render-savings.py` | `compare.json` → `savings.html`, or per-owner savings reports |
 
-Key flags (`analyze.py`): `--conn`, `--days`, `--org`, `--latency-slo-sec`,
-`--freshness`, `--acceptable-slowdown-sec`, `--goal`, `--config`, and `--out`.
+Key flags (`analyze.py`): `--conn`, `--from-rows`, `--from-cost-table`, `--sigma-only`,
+`--scan`, `--days`, `--org`, `--latency-slo-sec`, `--freshness`,
+`--acceptable-slowdown-sec`, `--goal`, `--config`, and `--out`.
 
 ## Cortex Code note
 The attribution SQL is portable — it runs equally well from Cortex Code / a Snowflake
@@ -90,3 +125,10 @@ Sigma REST API, so the end-to-end loop lives here.
 - Never recommend removal without a measured counterfactual inside the latency allowance.
 - Treat warehouse idle as an upper bound, not as Sigma-attributable savings.
 - Do not automatically act on controls, semantic changes, warehouse sizing, or deletion.
+- Never infer low utilization from missing read evidence: cost-table and Sigma-only
+  inputs route materializations to `Investigate`.
+- Report consolidation savings separately; they overlap the per-element estimates.
+- Don't recommend split refresh (history + recent, unioned) by default; see the playbook's
+  prerequisites.
+- Real outputs (inventories, scans, reports) are confidential and never go into this
+  repository. Examples and tests use synthetic data only.

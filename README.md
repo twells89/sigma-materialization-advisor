@@ -31,10 +31,16 @@ alone; removal requires a measured no-materialization baseline.
 ## Decisions
 - **Keep** — observed reads justify refresh cost and cached p95 meets the target.
 - **Retune** — useful, but refreshing more often than usage/source updates require.
-- **Investigate** — low observed utilization, control risk, or incomplete lineage.
+- **Investigate** — low observed utilization, control risk, incomplete lineage, or no read
+  evidence in this input path.
 - **Remove candidate** — only after a measured counterfactual stays within the latency SLO.
 - **Add candidate** — repeated live workload where refresh TCO is likely lower.
 - **Optimize query/model** — lower the per-run floor before adding more caching.
+- **Consolidate into data model** — the same logic is built or queried in several
+  workbooks; build it once in a data model and repoint the elements.
+
+Every decision carries a High/Medium/Low impact tier and short fix steps written for a
+workbook owner. Served reads include exports and screenshots as well as interactive queries.
 
 Observed read matching currently covers workbook materializations. Data-model
 materializations remain `Investigate` until their schedule and downstream-consumer
@@ -64,8 +70,14 @@ export SIGMA_BASE_URL=https://<region-api-host>
 export SIGMA_CLIENT_ID=... SIGMA_CLIENT_SECRET=...
 python3 scripts/enrich.py --inv out/inventory.json
 
-# report
+# report (or one report per workbook owner + owners.csv)
 python3 scripts/render-html.py --inv out/inventory.json --out out/report.html --customer "Acme"
+python3 scripts/render-html.py --inv out/inventory.json --by-owner out/owners --customer "Acme"
+
+# measure realized savings 2+ weeks after changes (re-run analyze + enrich into out2 first)
+python3 scripts/compare.py --before out/inventory.json --after out2/inventory.json --out out/compare
+python3 scripts/render-savings.py --compare out/compare/compare.json --out out/savings.html --customer "Acme"
+python3 scripts/render-savings.py --compare out/compare/compare.json --by-owner out/savings-owners
 
 # remediate (opt-in) — needs Sigma REST creds:
 eval "$(/path/to/get-token.sh)"          # sets SIGMA_API_TOKEN + SIGMA_BASE_URL
@@ -89,17 +101,41 @@ account:
    ```
 
 The heavy lifting stays in-warehouse while Sigma enrichment runs only where REST access
-is available.
+is available. Include `"duplicates": []` from `sql/sigma_duplicates.sql` in the bundle to
+get duplicate-work findings.
+
+## Without Snowflake access
+Teams whose users can't query `ACCOUNT_USAGE` have two other paths. A central team can
+also run the Snowflake path and send each owner their own report with `--by-owner`.
+
+```bash
+# 1. Cost table: an export from any internal cost tool (CSV or JSON)
+#    columns: workbook_id | data_model_id | object, credits | cost,
+#    optional element_id, date, query_count, avg_sec, p95_sec, kind, owner_email
+python3 scripts/analyze.py --from-cost-table costs.csv --credit-price 3 --out out
+
+# 2. Sigma only: duplicate logic, schedules, refreshes/day, owners (no cost data)
+python3 scripts/scan_workbooks.py --out scan --name-contains "Sales"
+python3 scripts/analyze.py --sigma-only --scan scan/scan.json --out out
+```
+
+Neither path can see served reads, so materializations go to **Investigate** rather than
+Retune or Remove. Add `--scan scan.json` to the Snowflake path too: a materialized
+element's compiled SQL only reads its own write-back table, so duplicate logic behind
+materializations is found from the workbook definition instead.
 
 ## Scripts
 | File | Purpose |
 |---|---|
-| `scripts/analyze.py` | cost/performance evidence → v2 inventory + Markdown report |
-| `scripts/cost_model.py` | pure keep/retune/investigate/remove/add decision engine |
-| `scripts/enrich.py` | read-only Sigma schedule/control/lineage enrichment |
+| `scripts/analyze.py` | cost/performance evidence (any input path) → v2 inventory + Markdown report |
+| `scripts/cost_model.py` | pure keep/retune/investigate/remove/add/consolidate decision engine |
+| `scripts/scan_workbooks.py` | read-only Sigma API scan for duplicate logic, schedules, owners |
+| `scripts/enrich.py` | read-only Sigma schedule/control/lineage/owner enrichment |
 | `scripts/materialize.py` | explicit schedule CRUD and refresh actions (`--dry-run`) |
-| `scripts/render-html.py` | `inventory.json` → customer-facing `report.html` |
-| `sql/*.sql` | workload, coverage, materialization ROI, and warehouse context |
+| `scripts/render-html.py` | `inventory.json` → `report.html`, or per-owner reports |
+| `scripts/compare.py` | before/after inventories → realized savings + follow-through (`compare.json`, CSVs, `COMPARE.md`) |
+| `scripts/render-savings.py` | `compare.json` → `savings.html` (what was saved, what was acted on, by owner, still open) |
+| `sql/*.sql` | workload, coverage, materialization ROI, duplicates, and warehouse context |
 | `example/make-sample.py` | regenerate the synthetic example |
 
 ## Privacy & safety
@@ -112,6 +148,21 @@ unless you pass `--yes`. See [`PRIVACY.md`](PRIVACY.md). The committed
 [`example/`](example/) is **fully synthetic** (fictional "Northwind Trading Co.") — no real
 data. Real outputs are customer-confidential; `.gitignore` keeps `*-out/` and creds out of
 git.
+
+## Contributing
+This repository is public. Never commit customer names, people, internal tool names, real
+table or account names, or numbers from a real account, including in commit messages and PR
+text. Tests and examples use synthetic data only. Enable the denylist hooks once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hooks check staged changes and commit messages against a private term list kept
+**outside** the repository (`~/.config/sigma-performance-advisor/denylist.txt`, or
+`$SPA_DENYLIST`), so the list itself is never published. Run
+`.githooks/check-denylist.sh --tree` to sweep every tracked file, or `--file <path>` on a PR
+body before posting it.
 
 ## License
 MIT — see [`LICENSE`](LICENSE).

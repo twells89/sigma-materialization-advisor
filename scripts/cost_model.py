@@ -21,6 +21,75 @@ DEFAULT_CONFIG = {
     "min_served_reads_per_refresh": 1.0,
     "retune_refresh_reduction_pct": 0.5,
     "big_bytes": 1_000_000_000,
+    "impact_high_monthly": 100.0,
+    "impact_medium_monthly": 20.0,
+}
+
+
+ACTION_STEPS = {
+    "Keep materialization": [
+        "No change needed: the saved copy is being used and loads fast.",
+        "Look again next month. If fewer people open the workbook, refresh it less often.",
+    ],
+    "Retune materialization": [
+        "Open the workbook, find the element named in the report, and open its "
+        "materialization schedule.",
+        "Ask the data owner how often the underlying data really changes; refresh "
+        "no more often than that (daily is often enough).",
+        "Lower the schedule (for example from hourly to every 4 hours or daily) and "
+        "write down the old setting first.",
+        "Check again in a week or two: the workbook should open just as fast and "
+        "refresh credits should drop.",
+    ],
+    "Remove materialization candidate": [
+        "Confirm with the workbook owner that nobody relies on the saved copy.",
+        "Write down the current schedule (cron and timezone) so it can be restored.",
+        "Turn the schedule off and watch load time and credits for one to two weeks.",
+        "Restore the schedule if the workbook becomes slower than your target.",
+    ],
+    "Add materialization candidate": [
+        "Open the workbook and find the element named in the report: it is opened "
+        "often and costs a lot each time.",
+        "Turn on materialization for that element with a daily schedule at a quiet hour.",
+        "After a week, compare load time and credits; keep it only if both improve.",
+    ],
+    "Optimize query/model": [
+        "Open the element and remove columns it does not show; add a date or "
+        "category filter if people only look at part of the data.",
+        "If several elements repeat the same joins or calculations, move them into "
+        "one shared data model so the work happens once.",
+        "Ask your data team whether the source table is organized (clustered) by "
+        "the column you filter on most.",
+        "Re-run this report next week to see whether cost and load time dropped.",
+    ],
+    "Optimize then reassess": [
+        "Open the element and look for large joins, heavy calculations, or "
+        "missing filters.",
+        "Fix the slowest part first, then re-run this report before adding "
+        "more materialization.",
+    ],
+    "Investigate materialization": [
+        "Open the workbook and check whether the schedule is active, failing, or "
+        "recently changed.",
+        "Check in Sigma who opens the workbook and how often.",
+        "If page controls (filters) feed this element, review them: they can "
+        "bypass the saved copy.",
+        "Change nothing until the owner has decided to keep, lower, or remove it.",
+    ],
+    "Consolidate into data model": [
+        "Create one data model that holds the shared logic (same source tables, "
+        "joins, and calculations).",
+        "Turn on materialization on that data model at the cadence the most "
+        "demanding workbook needs.",
+        "Repoint each listed workbook element to the data model instead of its "
+        "own copy.",
+        "Keep the old schedules until readers have moved over, then turn them "
+        "off with the owner's approval.",
+    ],
+    "Monitor": [
+        "Nothing to do now.",
+        "Re-run this report after a month to see whether usage or cost changed.",
+    ],
 }
 
 
@@ -64,6 +133,13 @@ def coerce_row(row):
     return result
 
 
+def _num(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _monthly(value, days):
     return float(value or 0) * 30.0 / max(float(days or 30), 1.0)
 
@@ -84,8 +160,7 @@ def _result(action, why, confidence, risk, performance, validation,
     }
 
 
-def recommend(row, config=None, days=30, credit_price=3.0):
-    """Return an evidence-based action for one query or materialization opportunity."""
+def _recommend_core(row, config=None, days=30, credit_price=3.0):
     cfg = merge_config(config)
     r = coerce_row(row)
     query_credits = r.get("CREDITS", 0) + r.get("QAS_CREDITS", 0)
@@ -121,6 +196,25 @@ def recommend(row, config=None, days=30, credit_price=3.0):
                 "medium", "high", "Unknown until control/lineage behavior is verified.",
                 "Review controls and lineage, then benchmark the element with and "
                 "without materialization before changing the schedule.",
+            )
+        if r.get("READ_EVIDENCE_AVAILABLE", True) in (False, 0, "false", "False"):
+            facts = []
+            rpd = _num(r.get("REFRESHES_PER_DAY"))
+            if rpd:
+                facts.append(f"It refreshes about {rpd:g} time(s) a day.")
+            if mat_credits:
+                facts.append(f"Refresh cost is about {mat_credits:.2f} credits/month "
+                             f"(${mat_cost:,.0f}).")
+            return _result(
+                "Investigate materialization",
+                ("Read utilization cannot be measured from this evidence (no "
+                 "Snowflake query history), so it is unknown whether anyone uses "
+                 "the saved copy. " + " ".join(facts)).strip(),
+                "low", "medium",
+                "Unknown: served reads and load time were not measured.",
+                "Check who opens this workbook (usage in Sigma) or re-run the "
+                "analysis against Snowflake query history before changing the "
+                "schedule.",
             )
         if mat_runs == 0:
             return _result(
@@ -263,6 +357,121 @@ def recommend(row, config=None, days=30, credit_price=3.0):
     )
 
 
+def impact_tier(action, savings_expected, p95, cfg):
+    """High/Medium/Low by monthly savings or how far p95 exceeds the latency target."""
+    if action in ("Monitor", "Keep materialization"):
+        return "Low"
+    slo = float(cfg["latency_slo_sec"])
+    if (savings_expected >= float(cfg["impact_high_monthly"])
+            or (p95 and p95 >= 3 * slo)):
+        return "High"
+    if (savings_expected >= float(cfg["impact_medium_monthly"])
+            or (p95 and p95 > slo)):
+        return "Medium"
+    return "Low"
+
+
+def _finish(result, p95, cfg):
+    result["IMPACT"] = impact_tier(
+        result["ACTION"], result["SAVINGS_EXPECTED"], p95, cfg)
+    result["FIX_STEPS"] = list(ACTION_STEPS.get(result["ACTION"], []))
+    return result
+
+
+def recommend(row, config=None, days=30, credit_price=3.0):
+    """Return an evidence-based action for one query or materialization opportunity."""
+    cfg = merge_config(config)
+    r = coerce_row(row)
+    p95 = r.get("P95_SEC") or r.get("AVG_SEC")
+    return _finish(_recommend_core(row, cfg, days, credit_price), p95, cfg)
+
+
+MATCH_LABELS = {
+    "identical-build": "build the identical table",
+    "identical-sql": "use identical SQL",
+    "identical-logic": "use identical logic",
+    "same-source": "read the same source",
+    "same-base-tables": "read the same source tables",
+    "identical-live-query": "run the same live query",
+}
+
+
+def group_credits(group):
+    """(total, redundant) credits across a group's members (redundant = all but the largest)."""
+    credits = [_num(m.get("CREDITS")) for m in group.get("MEMBERS", [])]
+    total = sum(credits)
+    return total, total - max(credits, default=0.0)
+
+
+def recommend_consolidation(group, config=None, days=30, credit_price=3.0):
+    """Recommend building shared logic once in a data model for a duplicate group."""
+    cfg = merge_config(config)
+    match = group.get("MATCH")
+    members = group.get("MEMBERS", [])
+    n = int(group.get("MEMBER_COUNT") or len(members))
+    total, redundant = group_credits(group)
+    if group.get("REDUNDANT_CREDITS") is not None:
+        redundant = _num(group.get("REDUNDANT_CREDITS"))
+    if group.get("TOTAL_CREDITS") is not None:
+        total = _num(group.get("TOTAL_CREDITS"))
+    monthly = _monthly(redundant, days) * credit_price
+    per_day = sum(_num(m.get("REFRESHES_PER_DAY")) for m in members)
+    low = expected = high = 0.0
+    if match in ("identical-build", "identical-sql", "identical-logic"):
+        low, expected, high = monthly * .5, monthly * .8, monthly
+    elif match in ("same-base-tables", "same-source"):
+        expected, high = monthly * .3, monthly * .6
+    elif match == "identical-live-query":
+        expected, high = monthly * .3, monthly * .5
+    confidence = "medium" if match in ("identical-build", "identical-logic") else "low"
+    risk = "high" if match in ("same-base-tables", "same-source") else "medium"
+    what = MATCH_LABELS.get(match, "overlap")
+    if total > 0:
+        why = (f"{n} elements {what}, so the same work is done {n} times. "
+               f"Roughly {redundant:.2f} of {total:.2f} credits in this window are "
+               f"repeat work (about ${monthly:,.0f}/month at list price).")
+    else:
+        why = (f"{n} elements {what}, so the same work is done {n} times"
+               + (f" (about {per_day:g} scheduled refreshes a day in total)"
+                  if per_day else "")
+               + ". No cost data in this run, so savings are not estimated.")
+    if match in ("same-base-tables", "same-source"):
+        why += (" Their SQL differs, so check the logic really overlaps before "
+                "combining.")
+    if match == "identical-live-query":
+        why += " Materialize it once in a data model instead of querying live each time."
+    ref = str(group.get("SOURCE_REF") or "")
+    if ref.startswith("data-model:"):
+        why += (f" They all start from the data-model element {ref[len('data-model:'):]}: "
+                "materialize that data-model element (or a new data-model element "
+                "with these columns) once instead of in each workbook.")
+    if n >= 3:
+        why += (" A table in your warehouse (for example a Snowflake dynamic table "
+                "or dbt model) may fit better if other tools also need this data.")
+    validation = (
+        "Build the shared logic once in a data model, materialize it there, "
+        "repoint the listed elements, keep the old schedules until reads move, "
+        "then retire them under the removal safeguards.")
+    result = _result(
+        "Consolidate into data model", why, confidence, risk,
+        "Repointed elements read one shared table: expect similar or better load "
+        "time; the shared refresh now serves all of them.",
+        validation, low, expected, high,
+    )
+    _finish(result, 0, cfg)
+    if ref.startswith("data-model:"):
+        result["FIX_STEPS"] = [
+            f"Open the data model and turn on materialization for the element "
+            f"{ref[len('data-model:'):]}, or add a new data-model element with "
+            "the columns these workbooks use and materialize that.",
+            "Repoint each listed workbook element to the data-model element "
+            "instead of materializing its own copy.",
+            "Keep the old schedules until readers have moved over, then turn them "
+            "off with the owner's approval.",
+        ]
+    return result
+
+
 def score(row, config=None):
     cfg = merge_config(config)
     r = coerce_row(row)
@@ -271,10 +480,14 @@ def score(row, config=None):
                + r.get("MATERIALIZATION_QAS_CREDITS", 0))
     p95 = r.get("P95_SEC") or r.get("AVG_SEC")
     runs = r.get("RUNS", 0) + r.get("MATERIALIZATION_RUNS", 0)
+    if r.get("MEMBERS"):
+        credits = group_credits(r)[1]
+        runs = sum(_num(m.get("REFRESHES_PER_DAY")) for m in r["MEMBERS"]) * len(r["MEMBERS"])
     action = str(r.get("ACTION") or r.get("RECOMMENDATION") or "")
     action_weight = {
         "Remove materialization candidate": 500,
         "Retune materialization": 400,
+        "Consolidate into data model": 450,
         "Investigate materialization": 350,
         "Optimize query/model": 300,
         "Optimize then reassess": 300,

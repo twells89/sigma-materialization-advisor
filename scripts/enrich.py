@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,18 +37,27 @@ class SigmaClient:
             with urllib.request.urlopen(req, timeout=60) as response:
                 self.token = json.load(response)["access_token"]
 
-    def get(self, path):
+    def get(self, path, retries=4):
         req = urllib.request.Request(
             self.base + path, method="GET",
             headers={"Authorization": f"Bearer {self.token}",
                      "Accept": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=90) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")[:300]
-            raise RuntimeError(f"GET {path} -> HTTP {exc.code}: {detail}") from exc
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < retries:
+                    try:
+                        wait = float(exc.headers.get("Retry-After") or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        wait = 0.0
+                    time.sleep(min(max(wait, 2 ** attempt), 30))
+                    continue
+                detail = exc.read().decode(errors="replace")[:300]
+                raise RuntimeError(
+                    f"GET {path} -> HTTP {exc.code}: {detail}") from exc
 
     def paged(self, path, limit=1000):
         entries, page = [], None
@@ -95,6 +105,41 @@ def match_workbook(candidate, workbooks):
     return None
 
 
+def owner_email(client, owner_id, cache, warnings):
+    """Member email for an ownerId; lookups are cached and failures only warn."""
+    owner_id = str(owner_id or "")
+    if not owner_id:
+        return None
+    if owner_id not in cache:
+        try:
+            member = client.get("/v2/members/" + urllib.parse.quote(owner_id, safe=""))
+            cache[owner_id] = member.get("email")
+        except RuntimeError as exc:
+            warnings.append(f"owner lookup failed: {exc}")
+            cache[owner_id] = None
+    return cache[owner_id]
+
+
+def set_owner(row, workbook, client, cache, warnings):
+    owner_id = workbook.get("ownerId")
+    if not owner_id:
+        return
+    row["OWNER_ID"] = owner_id
+    email = owner_email(client, owner_id, cache, warnings)
+    if email:
+        row["OWNER_EMAIL"] = email
+
+
+def fill_group_owners(groups, workbooks, client, cache, warnings):
+    for group in groups or []:
+        for member in group.get("MEMBERS") or []:
+            if member.get("OWNER_EMAIL") or "/workbook/" not in str(member.get("OBJECT") or ""):
+                continue
+            workbook = match_workbook(member, workbooks)
+            if workbook:
+                set_owner(member, workbook, client, cache, warnings)
+
+
 def node_from_candidate(candidate):
     sample = str(candidate.get("SAMPLE_URL") or "")
     query = urllib.parse.parse_qs(urllib.parse.urlparse(sample).query)
@@ -114,6 +159,7 @@ def main():
     client = SigmaClient()
     workbooks = client.paged("/v2/workbooks")
     cache, warnings = {}, list(inventory.get("warnings", []))
+    owners = {}
     matched = 0
     for candidate in inventory.get("candidates", []):
         if "/workbook/" not in str(candidate.get("OBJECT") or ""):
@@ -134,6 +180,7 @@ def main():
             continue
         matched += 1
         workbook_id = str(workbook["workbookId"])
+        set_owner(candidate, workbook, client, owners, warnings)
         if workbook_id not in cache:
             quoted = urllib.parse.quote(workbook_id, safe="")
             try:
@@ -201,6 +248,7 @@ def main():
         ))
         candidate["SCORE"] = round(score(candidate, inventory.get("config")), 2)
 
+    fill_group_owners(inventory.get("duplicate_groups"), workbooks, client, owners, warnings)
     inventory["candidates"].sort(key=lambda row: -row.get("SCORE", 0))
     actions = {}
     total_savings = 0.0
@@ -219,6 +267,7 @@ def main():
     inventory["enrichment"] = {
         "accessible_workbooks": len(workbooks),
         "matched_candidates": matched,
+        "owners_resolved": sum(1 for email in owners.values() if email),
         "control_target_bindings_available": False,
     }
     output = args.out or args.inv

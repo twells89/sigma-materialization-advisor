@@ -1,8 +1,14 @@
 -- Observed materialization cost and utilization.
 -- Requires access to SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY (Enterprise Edition).
 -- A low match rate is evidence to investigate; it is not proof that removal is safe.
+-- Served reads count every non-materialization query kind (adhoc, export, screenshot, ...).
 set days = 30;
 set org = '';
+-- The window ends where credit attribution ends (QUERY_ATTRIBUTION_HISTORY lags
+-- QUERY_HISTORY by hours), so the newest runs are not counted at zero cost.
+set end_ts = (select coalesce(max(start_time), current_timestamp())
+              from snowflake.account_usage.query_attribution_history
+              where start_time > dateadd('day', -$days, current_timestamp()));
 
 with tagged as (
   select query_id, total_elapsed_time/1000.0 sec,
@@ -18,7 +24,7 @@ with tagged as (
            iff(position('{' in query_tag) > 0,
                try_parse_json(substr(query_tag, position('{' in query_tag))), null) j
     from snowflake.account_usage.query_history
-    where start_time > dateadd('day', -$days, current_timestamp())
+    where start_time > dateadd('day', -$days, $end_ts) and start_time <= $end_ts
       and query_tag ilike 'Sigma %' and execution_status='SUCCESS'
   )
   where j:"sourceUrl"::string is not null
@@ -28,7 +34,7 @@ att as (
   select query_id, sum(credits_attributed_compute) credits,
          sum(credits_used_query_acceleration) qas_credits
   from snowflake.account_usage.query_attribution_history
-  where start_time > dateadd('day', -$days, current_timestamp())
+  where start_time > dateadd('day', -$days, $end_ts) and start_time <= $end_ts
   group by 1
 ),
 mat_runs as (
@@ -56,7 +62,7 @@ read_objects as (
   from tagged t
   join snowflake.account_usage.access_history ah using(query_id),
        lateral flatten(input=>ah.direct_objects_accessed) f
-  where t.kind='adhoc'
+  where coalesce(t.kind,'') <> 'materialization'
 ),
 matched_queries as (
   select distinct m.source_url, t.query_id, t.sec, coalesce(att.credits,0) credits,
@@ -79,7 +85,7 @@ workbook_reads as (
          round(sum(coalesce(att.qas_credits,0)),4) workbook_read_qas_credits,
          round(approx_percentile(sec,.95),2) workbook_read_p95_sec
   from tagged left join att using(query_id)
-  where kind='adhoc' group by 1
+  where coalesce(kind,'') <> 'materialization' group by 1
 )
 select m.org, m.object, m.element, m.source_url sample_url,
        m.materialization_runs, m.materialization_credits,

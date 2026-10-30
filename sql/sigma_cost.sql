@@ -7,6 +7,11 @@
 set days     = 30;     -- analysis window (days)
 set org      = '';     -- '' = account-wide; else a Sigma org slug, e.g. 'acme'
 set min_runs = 2;      -- ignore objects run fewer than this many times
+-- The window ends where credit attribution ends (QUERY_ATTRIBUTION_HISTORY lags
+-- QUERY_HISTORY by hours), so the newest runs are not counted at zero cost.
+set end_ts = (select coalesce(max(start_time), current_timestamp())
+              from snowflake.account_usage.query_attribution_history
+              where start_time > dateadd('day', -$days, current_timestamp()));
 
 with qh as (
   select query_id, query_parameterized_hash, total_elapsed_time, bytes_scanned,
@@ -15,7 +20,7 @@ with qh as (
          iff(position('{' in query_tag) > 0,
              try_parse_json(substr(query_tag, position('{' in query_tag))), null) as j
   from snowflake.account_usage.query_history
-  where start_time > dateadd('day', -$days, current_timestamp())
+  where start_time > dateadd('day', -$days, $end_ts) and start_time <= $end_ts
     and query_tag ilike 'Sigma %'
     and execution_status = 'SUCCESS'
 ),
@@ -37,7 +42,7 @@ att as (
   select query_id, sum(credits_attributed_compute) as credits,
          sum(credits_used_query_acceleration) as qas_credits
   from snowflake.account_usage.query_attribution_history
-  where start_time > dateadd('day', -$days, current_timestamp())
+  where start_time > dateadd('day', -$days, $end_ts) and start_time <= $end_ts
   group by 1
 )
 select
